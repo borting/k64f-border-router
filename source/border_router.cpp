@@ -20,6 +20,8 @@
 #include "nanostack-border-router/borderrouter_tasklet.h"
 #include "sal-nanostack-driver-k64f-eth/k64f_eth_nanostack_port.h"
 #include "sal-stack-nanostack-slip/Slip.h"
+#include "sockets/UDPSocket.h"
+#include "sal/socket_api.h"
 
 #if YOTTA_CFG_K64F_BORDER_ROUTER_DEBUG_TRACES==1
 #define HAVE_DEBUG 1
@@ -64,12 +66,23 @@ static DigitalOut led1(LED1);
 static Ticker led_ticker;
 #endif
 
+static border_router_status_t border_router_state = BORDER_ROUTER_DISCONNECTED;
+
+#define ECHO_SERVER_PORT 10000
+
 static void app_heap_error_handler(heap_fail_t event);
 
-static void toggle_led1()
-{
-    led1 = !led1;
-}
+using namespace mbed::Sockets::v0;
+
+UDPSocket *udpserver;
+
+const int BUFFER_SIZE = 256;
+char buffer[BUFFER_SIZE] = {0};
+
+//static void toggle_led1()
+//{
+//    led1 = !led1;
+//}
 
 /**
  * \brief Prints string to serial (adds CRLF).
@@ -129,6 +142,63 @@ void backhaul_driver_init(void (*backhaul_driver_status_cb)(uint8_t, int8_t))
     tr_error("Unsupported backhaul driver: %s", driver);
 }
 
+void onError(Socket *s, socket_error_t err) {
+  (void) s;
+  tr_error("udpSocket Error: %s (%d)\r\n", socket_strerror(err), err);
+}
+
+void onRx(Socket *s) {
+  SocketAddr addr;
+  uint16_t port;
+  size_t len = BUFFER_SIZE-1;
+  /* Recieve the packet */
+  socket_error_t err = s->recv_from(buffer, &len, &addr, &port);
+  if (!s->error_check(err) && len) {
+    buffer[len] = 0;
+    /* Send the packet */
+    err = s->send_to(buffer,len,&addr,port);
+    tr_info("udpServer: Received message: %s\r\n",buffer);
+    if (err != SOCKET_ERROR_NONE) {
+      onError(s, err);
+    }
+  }
+}
+
+
+void border_router_callback(border_router_status_t _state)
+{
+    tr_info("border_router_callback() %d", _state);
+    socket_error_t err;
+
+    border_router_state = _state;
+    if (border_router_state == BORDER_ROUTER_CONNECTED) {
+        tr_info("Border router initialization completed.");
+
+        udpserver = new UDPSocket(SOCKET_STACK_NANOSTACK_IPV6);
+        if (udpserver == NULL) {
+	  tr_error("udpserver failed");
+	  return;
+	}
+
+	// set error handler
+      	udpserver->setOnError(UDPSocket::ErrorHandler_t(onError));
+
+      	// open socket and bind
+      	udpserver->open(SOCKET_AF_INET6);
+      	err = udpserver->bind("0.0.0.0",ECHO_SERVER_PORT);
+      	if (err) {
+      	  tr_error("udp Socket bind error");
+	  return;
+      	}
+      	
+      	// set read handler
+	udpserver->setOnReadable(UDPSocket::ReadableHandler_t(onRx));
+	tr_info("UDP server ready");
+    } else {
+      tr_info("Border router error.");
+    }
+}
+
 /**
  * \brief The entry point for this application.
  * Sets up the application and starts the border router module.
@@ -179,13 +249,13 @@ void app_start(int, char **)
 
 #ifndef MBED_CONF_RTOS_PRESENT
     // run LED toggler in the Minar scheduler
-    minar::Scheduler::postCallback(mbed::util::FunctionPointer0<void>
-                                  (toggle_led1).bind()).period(minar::milliseconds(500));
+    //minar::Scheduler::postCallback(mbed::util::FunctionPointer0<void>
+    //                              (toggle_led1).bind()).period(minar::milliseconds(500));
 #else
-    led_ticker.attach_us(toggle_led1, 500000);
+    //led_ticker.attach_us(toggle_led1, 500000);
 #endif
     tr_info("Starting K64F border router...");
-    border_router_start();
+    border_router_start(&border_router_callback);
 }
 
 #ifdef MBED_CONF_RTOS_PRESENT
